@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -26,10 +25,6 @@ type wHeader struct {
 
 func main() {
 	http.Handle("/", corsHandler(http.FileServer(http.Dir("public")).ServeHTTP))
-
-	// http.HandleFunc("/", corsHandler(func(w http.ResponseWriter, r *http.Request) {
-	// 	w.WriteHeader(200)
-	// }))
 
 	http.HandleFunc("/record/", corsHandler(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -93,16 +88,32 @@ func main() {
 		recordName := strings.TrimPrefix(r.URL.Path, "/record/")
 		d := mustOpenFile("public/recordings", recordName+".webm", os.O_CREATE|os.O_RDWR)
 		defer d.Close()
-		_, err1 := h.Seek(0, io.SeekStart)
-		_, err2 := b.Seek(0, io.SeekStart)
-		_, err3 := d.ReadFrom(h)
-		_, err4 := d.ReadFrom(b)
-		err = errors.Join(err1, err2, err3, err4)
+
+		_, err = h.Seek(0, io.SeekStart)
 		if err != nil {
-			log.Println("merge err", err)
+			log.Println("h seek err", err)
 			w.WriteHeader(500)
 			return
 		}
+		_, err = b.Seek(0, io.SeekStart)
+		if err != nil {
+			log.Println("b seek err", err)
+			w.WriteHeader(500)
+			return
+		}
+		_, err = d.ReadFrom(h)
+		if err != nil {
+			log.Println("h read err", err)
+			w.WriteHeader(500)
+			return
+		}
+		_, err = d.ReadFrom(b)
+		if err != nil {
+			log.Println("b read err", err)
+			w.WriteHeader(500)
+			return
+		}
+
 		log.Println("recording done", d.Name())
 	}))
 
