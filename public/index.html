@@ -1,0 +1,88 @@
+<html>
+	<head>
+		<title>h2rec</title>
+	</head>
+	<body>
+		<script type="module">
+      import { newMediaRecorder } from './recorder.js';
+
+      function wait(timeout = 0) {
+        return new Promise((resolve) => setTimeout(() => resolve(true), timeout));
+      }
+
+      function getDisplayMediaStream() {
+        return navigator.mediaDevices.getDisplayMedia({
+          video: {
+            displaySurface: "monitor",
+          },
+          audio: false,
+        });
+      }
+
+      function newReadableStream(recorder) {
+        return new ReadableStream({
+          _closed: false,
+
+          start(ctrl) {
+            recorder.ondataavailable = ev => {
+              if (ev.data.size === 0) return;
+
+              if (this._closed) return;
+
+              ev.data.arrayBuffer()
+                .then(ab => {
+                    if (this._closed) return;
+
+                    return ctrl.enqueue(new Uint8Array(ab));
+                })
+                .then(() => {
+                  if (this._closed) return;
+
+                  if (recorder.state !== 'recording') {
+                    ctrl.close();
+                  }
+                });
+            }
+          },
+
+          cancel(reason) {
+            this._closed = true;
+            recorder.stop();
+          }
+        });
+      }
+
+      async function upload(url, readableStream, retryAfter = 1000) {
+        try {
+          await fetch(url, { method: 'HEAD' });
+        } catch(error) {
+          await wait(retryAfter);
+          return upload(url, readableStream);
+        }
+
+        return fetch(url, { method: 'POST', body: readableStream, duplex: 'half'});
+      }
+
+      async function record(mediaStream, timeslice = 100) {
+        let mediaRecorder = newMediaRecorder(mediaStream);
+        let readableStream = newReadableStream(mediaRecorder);
+
+        mediaRecorder.start(timeslice);
+
+        let url = `/record/${mediaStream.id}-${Date.now()}`
+        try {
+          await upload(url, readableStream);
+        } catch {
+          return record(mediaStream, timeslice);
+        }
+      }
+
+      async function start() {
+        let mediaStream = await getDisplayMediaStream();
+        record(mediaStream);
+      }
+
+      window.addEventListener('click', () => start())
+    </script>
+	</body>
+</html>
