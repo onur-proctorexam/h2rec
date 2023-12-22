@@ -1,6 +1,8 @@
 package main
 
 import (
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -8,22 +10,22 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/at-wat/ebml-go"
 	"github.com/at-wat/ebml-go/webm"
 )
 
-type wHeader struct {
-	Header  webm.EBMLHeader `ebml:"EBML"`
-	Segment struct {
-		SeekHead webm.SeekHead `ebml:"SeekHead"`
-		Info     webm.Info     `ebml:"Info"`
-		Tracks   webm.Tracks   `ebml:"Tracks,stop"`
-	} `ebml:"Segment,size=unknown"`
+type wContainer struct {
+	Header  webm.EBMLHeader    `ebml:"EBML"`
+	Segment webm.SegmentStream `ebml:"Segment,size=unknown"`
 }
 
 func main() {
+	addr := flag.String("addr", ":8080", "http server listen addr")
+	tlscert := flag.String("tlscert", "certs/cert.pem", "tls cert file")
+	tlskey := flag.String("tlskey", "certs/key.pem", "tls key file")
+	flag.Parse()
+
 	http.Handle("/", corsHandler(http.FileServer(http.Dir("public")).ServeHTTP))
 
 	http.HandleFunc("/record/", corsHandler(func(w http.ResponseWriter, r *http.Request) {
@@ -32,97 +34,50 @@ func main() {
 			return
 		}
 
-		// NOTE: start time must be provided from client, this is just for POC
-		startTime := time.Now().UTC()
-		// src is io.Reader of webm bytestream format coming from client
-		src := r.Body
-
-		// extract initial segment, search webm bytestreamformat for explanation
-		wh := new(wHeader)
-		wh.Segment.Info.DateUTC = startTime
-		err := ebml.Unmarshal(src, wh, ebml.WithIgnoreUnknown(true))
-		if err != nil && err != ebml.ErrReadStopped {
-			log.Println("unmarshal err", err)
-			w.WriteHeader(400)
-			return
-		}
-
-		// write rest of the bytes (media segments) to a temp file (or any io.Writer...)
-
-		// this POC uses tmp file for simplicity
 		b, err := os.CreateTemp("", "*-.webm")
-		defer func() { os.Remove(b.Name()) }()
+		defer func() { b.Close() }()
 		if err != nil {
 			log.Println("tmp err", err)
 			w.WriteHeader(500)
 			return
 		}
 
-		// copy all bytes until stream closes, this POC does not handle http2 stream close error (page refresh or restarting stream, etc)
-		_, err = io.Copy(b, src)
-		if err != nil {
-			log.Println("copy err", err)
+		wc := new(wContainer)
+		err = ebml.Unmarshal(io.TeeReader(r.Body, b), wc)
+		if err != nil && !isStreamError(err) {
+			log.Println("unmarshal err", err)
 			w.WriteHeader(500)
 			return
 		}
 
-		// calculate recording duration as wall clock time since it's started, see NOTE above for startTime value
-		wh.Segment.Info.Duration = float64(time.Now().UTC().Sub(startTime).Milliseconds())
+		lc := wc.Segment.Cluster[len(wc.Segment.Cluster)-1]
+		fc := wc.Segment.Cluster[0]
+		lt := lc.Timecode + uint64(lc.SimpleBlock[len(lc.SimpleBlock)-1].Timecode)
+		ft := fc.Timecode + uint64(fc.SimpleBlock[0].Timecode)
+		wc.Segment.Info.Duration = float64(lt - ft)
 
-		// write initial segment bytes with calculated duration to writer, which is a temp file in this POC
-		h, err := os.CreateTemp("", "*-.webm")
-		defer func() { os.Remove(h.Name()) }()
-		if err != nil {
-			log.Println("tmp err", err)
-			w.WriteHeader(500)
-			return
-		}
-		err = ebml.Marshal(wh, h)
-		if err != nil {
-			log.Println("ebml marshall err", err)
-			w.WriteHeader(500)
-			return
-		}
-
-		// all bytes written to tmp files, merge them into playable webm
 		recordName := strings.TrimPrefix(r.URL.Path, "/record/")
 		d := mustOpenFile("public/recordings", recordName+".webm", os.O_CREATE|os.O_RDWR)
 		defer d.Close()
 
-		_, err = h.Seek(0, io.SeekStart)
+		err = ebml.Marshal(wc, d)
 		if err != nil {
-			log.Println("h seek err", err)
-			w.WriteHeader(500)
-			return
-		}
-		_, err = b.Seek(0, io.SeekStart)
-		if err != nil {
-			log.Println("b seek err", err)
-			w.WriteHeader(500)
-			return
-		}
-		_, err = d.ReadFrom(h)
-		if err != nil {
-			log.Println("h read err", err)
-			w.WriteHeader(500)
-			return
-		}
-		_, err = d.ReadFrom(b)
-		if err != nil {
-			log.Println("b read err", err)
+			log.Println("marshal err", err)
 			w.WriteHeader(500)
 			return
 		}
 
-		log.Println("recording done", d.Name())
+		err = os.Remove(b.Name())
+
+		log.Println("recording done", d.Name(), err)
 	}))
 
-	fmt.Println("Starting the server on :8080...")
+	fmt.Println("Starting the server on " + *addr)
 
-	if os.Getenv("APP_ENV") == "development" {
-		log.Fatal(http.ListenAndServeTLS(":8080", "certs/cert.pem", "certs/key.pem", nil))
+	if *tlscert == "" || *tlskey == "" {
+		log.Fatal(http.ListenAndServe(*addr, nil))
 	} else {
-		log.Fatal(http.ListenAndServe(":8080", nil))
+		log.Fatal(http.ListenAndServeTLS(*addr, *tlscert, *tlskey, nil))
 	}
 }
 
@@ -146,4 +101,23 @@ func mustOpenFile(dir, name string, flag int) *os.File {
 
 	file, _ := os.OpenFile(fname, flag, os.ModePerm)
 	return file
+}
+
+// http2 stream error, to catch canceled streams (refreshed browser page...)
+var sError = &streamError{}
+
+func isStreamError(err error) bool {
+	return errors.As(err, sError)
+}
+
+type streamErrCode uint32
+
+type streamError struct {
+	StreamID uint32
+	Code     streamErrCode
+	Cause    error
+}
+
+func (e streamError) Error() string {
+	return fmt.Sprintf("ID %v, code %v", e.StreamID, e.Code)
 }
